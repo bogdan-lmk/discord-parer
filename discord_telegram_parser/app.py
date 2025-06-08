@@ -13,6 +13,10 @@ from .main import DiscordParser
 
 class DiscordTelegramParser:
     def __init__(self):
+        # Reload environment variables before initializing services
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+        
         self.discord_parser = DiscordParser()
         self.telegram_bot = TelegramBotService(config.TELEGRAM_BOT_TOKEN)
         self.websocket_service = DiscordWebSocketService(self.telegram_bot)

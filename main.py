@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from time import sleep
 from loguru import logger
+from sys import stderr
 from translatepy.translators.google import GoogleTranslate
 from dotenv import load_dotenv
 from discord_telegram_parser.models.message import Message

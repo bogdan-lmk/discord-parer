@@ -89,9 +89,17 @@ class DiscordWebSocketService:
             channels = guild.get('channels', [])
             for channel in channels:
                 if channel['id'] == channel_id:
-                    # Проверяем, что это текстовый канал с announcement в названии
+                    # Проверяем в порядке приоритета:
+                    # 1. Точное название "announcements"
+                    if channel['type'] == 0 and channel['name'].lower() == 'announcements':
+                        return True
+                    # 2. Официальный тип announcement
+                    if channel.get('type') == 5:
+                        return True
+                    # 3. Другие варианты названий
                     if (channel['type'] == 0 and 
-                        'announcement' in channel['name'].lower()):
+                        any(keyword in channel['name'].lower() 
+                            for keyword in ['announcements'])):
                         return True
         return False
     
@@ -219,11 +227,26 @@ class DiscordWebSocketService:
             guild_name = guild_data['name']
             channels_in_guild = guild_data.get('channels', [])
             
-            # Ищем announcement каналы
+            # Ищем announcement каналы в порядке приоритета:
+            # 1. Точное название "announcements"
+            # 2. Официальный тип 5
+            # 3. Другие варианты названий
             announcement_channels = []
             for channel in channels_in_guild:
-                if (channel['type'] == 0 and  # Text channel
-                    'announcement' in channel['name'].lower()):
+                # 1. Точное совпадение с "announcements"
+                if channel['type'] == 0 and channel['name'].lower() == 'announcements':
+                    announcement_channels.append(channel)
+                    continue
+                
+                # 2. Официальный тип announcement
+                if channel.get('type') == 5:
+                    announcement_channels.append(channel)
+                    continue
+                
+                # 3. Другие варианты (только если еще не добавлен)
+                if (channel['type'] == 0 and 
+                    any(keyword in channel['name'].lower() 
+                        for keyword in ['announce', 'news', 'объявлен', 'анонс'])):
                     announcement_channels.append(channel)
             
             if announcement_channels:
@@ -265,6 +288,24 @@ class DiscordWebSocketService:
                             
                             access_type = "HTTP+WS" if http_works else "WS only"
                             logger.success(f"   ✅ Auto-added: {guild_name}#{channel_name} ({access_type})")
+                            
+                            # Add channel to subscriptions
+                            self.subscribed_channels.add(channel_id)
+                            if http_works:
+                                self.http_accessible_channels.add(channel_id)
+                            if websocket_works:
+                                self.websocket_accessible_channels.add(channel_id)
+                            
+                            # Only create topic once per server
+                            if guild_name not in [s for s in config.SERVER_CHANNEL_MAPPINGS.keys()]:
+                                if self.telegram_bot:
+                                    loop = asyncio.get_event_loop()
+                                    loop.run_in_executor(
+                                        None,
+                                        self.telegram_bot._get_or_create_topic_safe,
+                                        guild_name
+                                    )
+                            
                             new_channels_added += 1
                 
                 if new_channels_added > 0:
@@ -363,16 +404,31 @@ class DiscordWebSocketService:
             
             loop = asyncio.get_event_loop()
             
-            # Get or create topic for server (thread-safe)
+            # First try to get existing topic
             topic_id = await loop.run_in_executor(
                 None,
-                self.telegram_bot._get_or_create_topic_safe,
+                self.telegram_bot.get_server_topic_id,
                 message.server_name
             )
             
-            if topic_id is None and self.telegram_bot._check_if_supergroup_with_topics(config.TELEGRAM_CHAT_ID):
-                logger.error(f"❌ Failed to get/create topic for {message.server_name}")
-                return
+            # Only create new topic if none exists and we have permissions
+            if topic_id is None:
+                if self.telegram_bot._check_if_supergroup_with_topics(config.TELEGRAM_CHAT_ID):
+                    logger.info(f"🔍 No existing topic found for {message.server_name}, creating new one...")
+                    topic_id = await loop.run_in_executor(
+                        None,
+                        self.telegram_bot._get_or_create_topic_safe,
+                        message.server_name
+                    )
+                    
+                    if topic_id is None:
+                        logger.error(f"❌ Failed to get/create topic for {message.server_name}")
+                        return
+                else:
+                    logger.error("❌ Cannot create topic - chat doesn't support topics")
+                    return
+            else:
+                logger.info(f"✅ Using existing topic {topic_id} for {message.server_name}")
             
             # Format and send message
             formatted = self.telegram_bot.format_message(message)

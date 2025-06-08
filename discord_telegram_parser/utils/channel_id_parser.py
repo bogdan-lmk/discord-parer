@@ -99,10 +99,27 @@ class DiscordIDCollector:
                 }
 
                 channels = self.get_guild_channels(guild['id'])
-                announcement_channels = [
-                    ch for ch in channels 
-                    if ch['name'].lower() == 'announcements'
-                ]
+                # Ищем announcement каналы в порядке приоритета:
+                # 1. Точное название "announcements"
+                # 2. Официальный тип 5
+                # 3. Другие варианты названий
+                announcement_channels = []
+                for ch in channels:
+                    # 1. Точное совпадение с "announcements"
+                    if ch['type'] == 0 and ch['name'].lower() == 'announcements':
+                        announcement_channels.append(ch)
+                        continue
+                    
+                    # 2. Официальный тип announcement
+                    if ch.get('type') == 5:
+                        announcement_channels.append(ch)
+                        continue
+                    
+                    # 3. Другие варианты (только если еще не добавлен)
+                    if (ch['type'] == 0 and 
+                        any(keyword in ch['name'].lower() 
+                            for keyword in ['announce'])):
+                        announcement_channels.append(ch)
                 
                 for channel in announcement_channels:
                     guild_data['announcement_channels'][channel['name']] = {
@@ -114,7 +131,7 @@ class DiscordIDCollector:
                 print(f"\nServer: {guild['name']} (ID: {guild['id']})")
                 print(f"Announcement Channels: {len(announcement_channels)}")
                 for channel in announcement_channels:
-                    print(f"  - {channel['name']}")
+                    print(f"  - {channel['name']} (ID: {channel['id']}, Type: {channel.get('type')})")
 
             # Save data to JSON file
             with open('discord_announcement_channels.json', 'w', encoding='utf-8') as f:

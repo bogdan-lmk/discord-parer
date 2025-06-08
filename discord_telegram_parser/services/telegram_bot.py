@@ -41,6 +41,50 @@ class TelegramBotService:
                 'topics': self.server_topics
             }, f)
 
+    def sync_servers(self):
+        """Sync Discord servers with Telegram topics"""
+        try:
+            # Get current Discord servers
+            current_servers = set(config.SERVER_CHANNEL_MAPPINGS.keys())
+            
+            # Get Telegram topics
+            telegram_topics = set(self.server_topics.keys())
+            
+            logger.info(f"🔄 Syncing servers...")
+            logger.info(f"   Discord servers: {len(current_servers)}")
+            logger.info(f"   Telegram topics: {len(telegram_topics)}")
+            
+            # Clean up invalid topics first
+            cleaned_topics = self.cleanup_invalid_topics()
+            if cleaned_topics > 0:
+                logger.info(f"   🧹 Cleaned {cleaned_topics} invalid topics")
+                telegram_topics = set(self.server_topics.keys())  # Refresh after cleanup
+            
+            # Find new servers (create topics)
+            new_servers = current_servers - telegram_topics
+            if new_servers:
+                logger.info(f"   🆕 New servers found: {len(new_servers)}")
+                for server in new_servers:
+                    self._get_or_create_topic_safe(server)
+            
+            # Find removed servers (delete topics)
+            removed_servers = telegram_topics - current_servers
+            if removed_servers:
+                logger.info(f"   🗑️ Removing topics for deleted servers: {len(removed_servers)}")
+                for server in removed_servers:
+                    if server in self.server_topics:
+                        old_topic_id = self.server_topics[server]
+                        del self.server_topics[server]
+                        logger.info(f"      • Removed {server} (topic {old_topic_id})")
+                
+                if removed_servers:
+                    self._save_data()
+            
+            logger.success(f"✅ Server sync completed")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in server sync: {e}")
+
     def _check_if_supergroup_with_topics(self, chat_id):
         """Check if the chat supports topics"""
         try:
@@ -70,31 +114,51 @@ class TelegramBotService:
         except Exception:
             return False
 
+    def get_server_topic_id(self, server_name: str):
+        """Get existing topic ID for server (safe for real-time use)"""
+        # Быстрая проверка кэша без блокировки
+        if server_name in self.server_topics:
+            topic_id = self.server_topics[server_name]
+            print(f"📍 Found cached topic {topic_id} for server '{server_name}'")
+            return topic_id
+        return None
+
     def _get_or_create_topic_safe(self, server_name: str, chat_id=None):
         """Thread-safe method to get or create topic for server"""
         chat_id = chat_id or config.TELEGRAM_CHAT_ID
         
-        # Use lock to prevent concurrent topic creation
+        # ВАЖНО: Сначала проверяем кэш БЕЗ блокировки для быстрого доступа
+        if server_name in self.server_topics:
+            cached_topic_id = self.server_topics[server_name]
+            
+            # Быстрая проверка существования топика (только для реального времени)
+            if self._topic_exists(chat_id, cached_topic_id):
+                print(f"✅ Using existing cached topic {cached_topic_id} for server '{server_name}'")
+                return cached_topic_id
+            else:
+                print(f"⚠️ Cached topic {cached_topic_id} not found, will recreate")
+        
+        # Используем блокировку только если нужно создать/пересоздать топик
         with self.topic_creation_lock:
-            # Double-check if topic exists after acquiring lock
+            # Двойная проверка после получения блокировки
             if server_name in self.server_topics:
                 topic_id = self.server_topics[server_name]
                 
-                # Verify topic still exists
+                # Повторная проверка существования с блокировкой
                 if self._topic_exists(chat_id, topic_id):
-                    print(f"✅ Using existing topic {topic_id} for server '{server_name}'")
+                    print(f"✅ Using existing topic {topic_id} for server '{server_name}' (double-check)")
                     return topic_id
                 else:
-                    print(f"⚠️ Topic {topic_id} not found, removing from cache")
+                    print(f"🗑️ Topic {topic_id} confirmed missing, removing from cache")
                     del self.server_topics[server_name]
                     self._save_data()
             
-            # Check if we need to create topics (only for supergroups with topics)
+            # Проверяем, поддерживает ли чат топики
             if not self._check_if_supergroup_with_topics(chat_id):
                 print(f"ℹ️ Chat doesn't support topics, using regular messages")
                 return None
             
-            # Create a new forum topic
+            # Создаём новый топик
             print(f"🔨 Creating new topic for server '{server_name}'")
             
             try:
@@ -143,7 +207,7 @@ class TelegramBotService:
             formatted.append(f"📢 #{message.channel_name}")
         
         if config.TELEGRAM_UI_PREFERENCES['show_timestamps']:
-            formatted.append(f"📅 {message.timestamp.strftime('%H:%M:%S')}")
+            formatted.append(f"📅 {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
         
         formatted.append(f"👤 {message.author}")
         formatted.append(f"💬 {message.content}")
@@ -168,11 +232,14 @@ class TelegramBotService:
         for server_name, server_messages in server_groups.items():
             print(f"📤 Sending {len(server_messages)} messages for server: {server_name}")
             
-            # Get or create topic for this server (thread-safe)
-            topic_id = self._get_or_create_topic_safe(server_name)
+            # ИСПРАВЛЕНИЕ: Используем быстрый метод для проверки существующих топиков
+            topic_id = self.get_server_topic_id(server_name)
+            if not topic_id:
+                # Создаём топик только если его нет
+                topic_id = self._get_or_create_topic_safe(server_name)
             
             # Sort messages chronologically (oldest first)
-            server_messages.sort(key=lambda x: x.timestamp)
+            server_messages.sort(key=lambda x: x.timestamp, reverse=False)
             
             # Send messages in order
             for message in server_messages:
@@ -272,10 +339,6 @@ class TelegramBotService:
             
         return None
 
-    def get_server_topic_id(self, server_name: str):
-        """Get topic ID for server (for external use)"""
-        return self.server_topics.get(server_name)
-
     def list_server_topics(self):
         """List all server topics"""
         return dict(self.server_topics)
@@ -311,7 +374,7 @@ class TelegramBotService:
                 "🤖 Welcome to Discord Announcement Parser!\n\n"
                 "🔥 **Real-time WebSocket Mode** - Instant message delivery!\n"
                 "📡 Messages are received via WebSocket for immediate forwarding\n"
-                "🔄 Improved topic management: One server = One topic\n\n"
+                "🔄 Improved topic management: One server = One topic (NO DUPLICATES)\n\n"
             )
             
             if supports_topics:
@@ -319,8 +382,9 @@ class TelegramBotService:
                     "🔹 Forum Topics Mode (Enabled):\n"
                     "• Each Discord server gets ONE topic\n"
                     "• Messages from all channels in server go to same topic\n"
+                    "• Smart caching prevents duplicate topic creation\n"
                     "• Auto-recovery for missing topics\n"
-                    "• No duplicate topics created\n"
+                    "• Fast topic lookup for real-time messages\n"
                     "• Messages displayed chronologically\n\n"
                 )
             else:
@@ -407,7 +471,8 @@ class TelegramBotService:
                     "• Auto-discovery of announcement channels\n"
                     "• Messages in chronological order (oldest first)\n"
                     "• Fallback polling for reliability\n"
-                    "• One server = One topic (no duplicates)\n"
+                    "• One server = One topic (NO DUPLICATES!)\n"
+                    "• Smart topic caching for real-time messages\n"
                 )
                 
                 if supports_topics:
@@ -416,6 +481,7 @@ class TelegramBotService:
                         "• Auto-created server topics\n"
                         "• Auto-recovery for missing topics\n"
                         "• Thread-safe topic management\n"
+                        "• Fast topic lookup prevents duplicates\n"
                     )
                 else:
                     help_text += (
@@ -427,7 +493,12 @@ class TelegramBotService:
                     "\n💡 To enable topics:\n"
                     "1. Convert this chat to a supergroup\n"
                     "2. Enable 'Topics' in group settings\n"
-                    "3. Restart the bot"
+                    "3. Restart the bot\n\n"
+                    "🛠️ Anti-Duplicate Features:\n"
+                    "• Fast topic cache lookup\n"
+                    "• Thread-safe topic creation\n"
+                    "• Double-check after lock acquisition\n"
+                    "• Real-time duplicate prevention"
                 )
                 
                 markup = InlineKeyboardMarkup()
@@ -449,7 +520,8 @@ class TelegramBotService:
                     f"🔹 Total Channels: {sum(len(channels) for channels in config.SERVER_CHANNEL_MAPPINGS.values()) if hasattr(config, 'SERVER_CHANNEL_MAPPINGS') else 0}\n"
                     f"🔹 Message Cache: {len(self.message_mappings)} messages\n"
                     f"🔹 WebSocket Channels: {len(self.websocket_service.subscribed_channels) if self.websocket_service else 0}\n"
-                    "🔹 Topic Logic: One server = One topic ✅\n\n"
+                    "🔹 Topic Logic: One server = One topic ✅\n"
+                    "🔹 Duplicate Prevention: Fast cache lookup ✅\n\n"
                     "📋 Current Topics:\n"
                 )
                 
@@ -512,7 +584,8 @@ class TelegramBotService:
                 message, 
                 f"📋 Select a server to view announcements:\n\n"
                 f"📊 {server_count} servers configured, {topic_count} topics created\n"
-                f"📋 = Has topic, ❌ = Invalid topic",
+                f"📋 = Has topic, ❌ = Invalid topic\n"
+                f"🛡️ Anti-duplicate protection: ON",
                 reply_markup=markup
             )
 
@@ -548,12 +621,12 @@ class TelegramBotService:
                 self.bot.answer_callback_query(call.id, "No new messages found")
                 return
             
-            # Send messages using improved topic logic
+            # Send messages using improved topic logic (no duplicates!)
             self.send_messages(new_messages)
             
             self.bot.answer_callback_query(
                 call.id,
-                f"Sent {len(new_messages)} new messages to server topic!"
+                f"Sent {len(new_messages)} new messages to server topic (no duplicates)!"
             )
             
             # Update last message timestamp
@@ -598,16 +671,16 @@ class TelegramBotService:
             
             # Show topic status
             topic_status = ""
-            if server_name in self.server_topics:
-                topic_id = self.server_topics[server_name]
-                if self._topic_exists(call.message.chat.id, topic_id):
-                    topic_status = f" to existing topic {topic_id}"
+            existing_topic_id = self.get_server_topic_id(server_name)
+            if existing_topic_id:
+                if self._topic_exists(call.message.chat.id, existing_topic_id):
+                    topic_status = f" to existing topic {existing_topic_id} (no duplicate)"
                 else:
                     topic_status = " (will create new topic - old one invalid)"
             else:
                 topic_status = " (will create new topic)"
             
-            # Send messages using improved topic logic
+            # Send messages using improved topic logic (prevents duplicates!)
             self.send_messages(messages)
             
             self.bot.answer_callback_query(
@@ -639,7 +712,8 @@ class TelegramBotService:
                 f"🔹 WebSocket Only: {len(self.websocket_service.websocket_accessible_channels)}\n"
                 f"🔹 Session ID: {self.websocket_service.session_id or 'Not connected'}\n"
                 f"🔹 Topics Created: {len(self.server_topics)}\n"
-                f"🔹 Topic Logic: One server = One topic ✅\n\n"
+                f"🔹 Topic Logic: One server = One topic ✅\n"
+                f"🔹 Duplicate Prevention: Fast cache lookup ✅\n\n"
                 "📡 Channel Access Types:\n"
             )
             
@@ -735,14 +809,12 @@ class TelegramBotService:
                 self.bot.reply_to(message, "No new messages found")
                 return
             
-            # Send messages using improved topic logic
+            # Send messages using improved topic logic (no duplicates!)
             self.send_messages(new_messages)
             
             # Show result with topic info
-            topic_info = ""
-            if state['server'] in self.server_topics:
-                topic_id = self.server_topics[state['server']]
-                topic_info = f" to topic {topic_id}"
+            existing_topic_id = self.get_server_topic_id(state['server'])
+            topic_info = f" to existing topic {existing_topic_id} (no duplicate)" if existing_topic_id else " to new topic"
             
             self.bot.reply_to(
                 message,
@@ -758,11 +830,12 @@ class TelegramBotService:
             """Handle regular text messages"""
             pass
 
-        print("🤖 Telegram Bot started with improved topic management:")
+        print("🤖 Telegram Bot started with ANTI-DUPLICATE topic management:")
         print("   ✅ One server = One topic")
+        print("   ✅ Fast cache lookup prevents duplicates")
         print("   ✅ Thread-safe topic creation")
         print("   ✅ Auto-cleanup of invalid topics")
-        print("   ✅ No duplicate topics")
+        print("   ✅ No duplicate topics for real-time messages")
         print("   ✅ Topic status indicators")
         print("   ✅ Enhanced status reporting")
         self.bot.polling(none_stop=True)
