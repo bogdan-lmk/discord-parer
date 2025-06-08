@@ -8,6 +8,7 @@ import json
 import os
 import time
 import threading
+import asyncio
 
 class TelegramBotService:
     def __init__(self, bot_token: str):
@@ -19,6 +20,7 @@ class TelegramBotService:
         self.message_store = 'telegram_messages.json'
         self.user_states = {}  # Track user navigation states
         self.server_topics = {}  # Store server -> topic_id mapping
+        self.websocket_service = None  # Will be set by main app
         
         # Load existing message mappings if file exists
         if os.path.exists(self.message_store):
@@ -240,15 +242,17 @@ class TelegramBotService:
         return None
 
     def start_bot(self):
-        """Start bot with interactive server/channel selection"""
+        """Start bot with interactive server/channel selection and WebSocket controls"""
         @self.bot.message_handler(commands=['start', 'help'])
         def send_welcome(message):
             # Check if chat supports topics
             supports_topics = self._check_if_supergroup_with_topics(message.chat.id)
             
             text = (
-                "👋 Welcome to Discord Announcement Parser!\n\n"
-                "This bot forwards Discord announcements to Telegram.\n\n"
+                "🤖 Welcome to Discord Announcement Parser!\n\n"
+                "🔥 **Real-time WebSocket Mode** - Instant message delivery!\n"
+                "📡 Messages are received via WebSocket for immediate forwarding\n"
+                "🔄 Fallback polling every 5 minutes for redundancy\n\n"
             )
             
             if supports_topics:
@@ -272,9 +276,10 @@ class TelegramBotService:
             markup = InlineKeyboardMarkup(row_width=2)
             markup.add(
                 InlineKeyboardButton("📋 Server List", callback_data="action_servers"),
-                InlineKeyboardButton("🔄 Refresh", callback_data="action_refresh"),
-                InlineKeyboardButton("ℹ️ Help", callback_data="action_help"),
-                InlineKeyboardButton("📊 Status", callback_data="action_status")
+                InlineKeyboardButton("🔄 Manual Sync", callback_data="action_refresh"),
+                InlineKeyboardButton("⚡ WebSocket Status", callback_data="action_websocket"),
+                InlineKeyboardButton("📊 Bot Status", callback_data="action_status"),
+                InlineKeyboardButton("ℹ️ Help", callback_data="action_help")
             )
             
             self.bot.send_message(message.chat.id, text, reply_markup=markup)
@@ -285,6 +290,8 @@ class TelegramBotService:
             
             if action == 'servers':
                 list_servers(call.message)
+            elif action == 'websocket':
+                show_websocket_status(call.message)
             elif action == 'refresh':
                 markup = InlineKeyboardMarkup()
                 if not self.user_states.get(call.from_user.id):
@@ -317,12 +324,16 @@ class TelegramBotService:
                 help_text = (
                     "📖 Bot Commands:\n\n"
                     "🔹 /servers - Browse Discord servers\n"
-                    "🔹 /refresh - Check for new messages\n"
+                    "🔹 /refresh - Manual message sync\n"
+                    "🔹 /websocket - WebSocket status\n"
                     "🔹 /help - Show this help\n"
                     "🔹 /reset_topics - Reset all topic mappings\n\n"
-                    "⚙️ Features:\n"
-                    "• Multiple Discord servers\n"
+                    "⚙️ Real-time Features:\n"
+                    "• WebSocket connections for instant delivery\n"
+                    "• Multiple Discord token support\n"
+                    "• Auto-discovery of announcement channels\n"
                     "• Messages in chronological order (oldest first)\n"
+                    "• Fallback polling for reliability\n"
                 )
                 
                 if supports_topics:
@@ -338,9 +349,7 @@ class TelegramBotService:
                     )
                 
                 help_text += (
-                    "• Message formatting\n"
-                    "• Auto-updates\n\n"
-                    "💡 To enable topics:\n"
+                    "\n💡 To enable topics:\n"
                     "1. Convert this chat to a supergroup\n"
                     "2. Enable 'Topics' in group settings\n"
                     "3. Restart the bot"
@@ -363,7 +372,8 @@ class TelegramBotService:
                     f"🔹 Active Topics: {len(self.server_topics)}\n"
                     f"🔹 Configured Channels: {sum(len(channels) for channels in config.SERVER_CHANNEL_MAPPINGS.values()) if hasattr(config, 'SERVER_CHANNEL_MAPPINGS') else 0}\n"
                     f"🔹 Message Cache: {len(self.message_mappings)} messages\n"
-                    "🔹 Update Interval: Manual refresh\n"
+                    f"🔹 WebSocket Channels: {len(self.websocket_service.subscribed_channels) if self.websocket_service else 0}\n"
+                    "🔹 Real-time Mode: ⚡ WebSocket + 🔄 Fallback polling\n"
                     "🔹 Message Order: Chronological (oldest first)\n\n"
                     "📋 Current Topics:\n"
                 )
@@ -386,6 +396,49 @@ class TelegramBotService:
                 send_welcome(call.message)
             
             self.bot.answer_callback_query(call.id)
+
+        @self.bot.message_handler(commands=['websocket'])
+        def show_websocket_status(message):
+            """Show WebSocket connection status"""
+            if not self.websocket_service:
+                self.bot.reply_to(message, "❌ WebSocket service not initialized")
+                return
+            
+            status_text = (
+                "⚡ WebSocket Status\n\n"
+                f"🔹 Service Running: {'✅ Yes' if self.websocket_service.running else '❌ No'}\n"
+                f"🔹 Active Connections: {len([ws for ws in self.websocket_service.websockets if ws.get('websocket')])}\n"
+                f"🔹 Subscribed Channels: {len(self.websocket_service.subscribed_channels)}\n"
+                f"🔹 Session ID: {self.websocket_service.session_id or 'Not connected'}\n"
+                f"🔹 Last Sequence: {self.websocket_service.last_sequence or 'None'}\n"
+                f"🔹 Heartbeat Interval: {self.websocket_service.heartbeat_interval}ms\n\n"
+                "📡 Subscribed Channels:\n"
+            )
+            
+            if self.websocket_service.subscribed_channels:
+                for channel_id in list(self.websocket_service.subscribed_channels)[:10]:  # Show first 10
+                    # Find server and channel name
+                    found = False
+                    for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
+                        if channel_id in channels:
+                            status_text += f"• {server}#{channels[channel_id]} ({channel_id})\n"
+                            found = True
+                            break
+                    if not found:
+                        status_text += f"• Unknown channel ({channel_id})\n"
+                        
+                if len(self.websocket_service.subscribed_channels) > 10:
+                    status_text += f"• ... and {len(self.websocket_service.subscribed_channels) - 10} more\n"
+            else:
+                status_text += "• No channels subscribed\n"
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🔄 Refresh Status", callback_data="action_websocket"),
+                InlineKeyboardButton("🔙 Back to Menu", callback_data="action_start")
+            )
+            
+            self.bot.reply_to(message, status_text, reply_markup=markup)
 
         @self.bot.message_handler(commands=['reset_topics'])
         def reset_topics(message):
@@ -423,7 +476,7 @@ class TelegramBotService:
                 state['channel_id'],
                 state['server'],
                 state['channel_name'],
-                since_timestamp=state.get('last_message')
+                limit=10
             )
             
             # Initialize last_message if not set
@@ -502,8 +555,9 @@ class TelegramBotService:
             messages = self.discord_parser.parse_announcement_channel(
                 channel_id,
                 server_name,
-                channel_name
-            )[:10]
+                channel_name,
+                limit=10
+            )
             
             # REVERSE ORDER: Sort by timestamp to ensure oldest first
             messages.sort(key=lambda x: x.timestamp)
@@ -571,7 +625,7 @@ class TelegramBotService:
                 state['channel_id'],
                 state['server'],
                 state['channel_name'],
-                since_timestamp=state.get('last_message')
+                limit=10
             )
             
             # Initialize last_message if not set
@@ -626,5 +680,5 @@ class TelegramBotService:
             if new_messages:
                 self.user_states[user_id]['last_message'] = new_messages[-1].timestamp
 
-        print("Telegram Bot started with Topics support, error recovery, and chronological message order")
+        print("Telegram Bot started with Topics support, WebSocket integration, error recovery, and chronological message order")
         self.bot.polling(none_stop=True)
