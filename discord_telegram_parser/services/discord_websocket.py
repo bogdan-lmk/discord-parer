@@ -274,15 +274,15 @@ class DiscordWebSocketService:
             logger.error(f"Error processing guild channels: {e}")
     
     async def handle_new_message(self, message_data):
-        """Process new message from WebSocket"""
+        """Process new message from WebSocket with improved topic management"""
         try:
             channel_id = message_data['channel_id']
             
-            # Проверяем, подписаны ли мы на этот канал
+            # Check if we're subscribed to this channel
             if channel_id not in self.subscribed_channels:
-                return  # Игнорируем неподписанные каналы
+                return  # Ignore unsubscribed channels
             
-            # Находим информацию о канале
+            # Find channel information
             server_name = None
             channel_name = None
             
@@ -293,18 +293,17 @@ class DiscordWebSocketService:
                     break
             
             if not server_name:
-                logger.warning(f"Message from subscribed but unmapped channel {channel_id}")
+                logger.warning(f"⚠️ Message from subscribed but unmapped channel {channel_id}")
                 return
             
-            # Безопасная обработка содержимого
+            # Safe content processing
             try:
                 content = message_data.get('content', '')
                 if content:
                     content = content.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
                     content = ''.join(char for char in content if ord(char) < 0x110000)
                 else:
-                    # Пропускаем пустые сообщения
-                    return
+                    return  # Skip empty messages
             except:
                 content = '[Message content encoding error]'
             
@@ -315,11 +314,11 @@ class DiscordWebSocketService:
             except:
                 author = 'Unknown User'
             
-            # Пропускаем системные сообщения без содержания
+            # Skip system messages without content
             if not content.strip():
                 return
             
-            # Создаем объект сообщения
+            # Create message object
             message = Message(
                 content=content,
                 timestamp=datetime.fromisoformat(message_data['timestamp'].replace('Z', '+00:00')),
@@ -328,7 +327,7 @@ class DiscordWebSocketService:
                 author=author
             )
             
-            # Определяем тип доступа для логирования
+            # Determine access type for logging
             access_type = ""
             if channel_id in self.http_accessible_channels and channel_id in self.websocket_accessible_channels:
                 access_type = " (HTTP+WS)"
@@ -340,53 +339,63 @@ class DiscordWebSocketService:
             logger.info(f"   👤 {author}")
             logger.info(f"   💬 {content[:100]}...")
             
-            # Отправляем в Telegram
+            # Check if topic exists for this server
+            if self.telegram_bot:
+                topic_id = self.telegram_bot.get_server_topic_id(server_name)
+                if topic_id:
+                    logger.info(f"   📍 Will send to existing topic {topic_id}")
+                else:
+                    logger.info(f"   🔨 Will create new topic for server {server_name}")
+            
+            # Forward to Telegram
             if self.telegram_bot:
                 await self.forward_to_telegram(message)
             else:
-                logger.warning("Telegram bot not available")
+                logger.warning("❌ Telegram bot not available")
                 
         except Exception as e:
-            logger.error(f"Error handling new message: {e}")
+            logger.error(f"❌ Error handling new message: {e}")
     
     async def forward_to_telegram(self, message):
-        """Forward message to Telegram bot asynchronously"""
+        """Forward message to Telegram bot asynchronously with proper topic management"""
         try:
             logger.info(f"🚀 Forwarding to Telegram: {message.server_name}#{message.channel_name}")
             
             loop = asyncio.get_event_loop()
             
-            # Получаем или создаем топик
+            # Get or create topic for server (thread-safe)
             topic_id = await loop.run_in_executor(
                 None,
-                self.telegram_bot._create_or_get_topic,
+                self.telegram_bot._get_or_create_topic_safe,
                 message.server_name
             )
             
-            if not topic_id:
-                logger.error(f"Failed to get/create topic for {message.server_name}")
+            if topic_id is None and self.telegram_bot._check_if_supergroup_with_topics(config.TELEGRAM_CHAT_ID):
+                logger.error(f"❌ Failed to get/create topic for {message.server_name}")
                 return
             
-            # Форматируем и отправляем
+            # Format and send message
             formatted = self.telegram_bot.format_message(message)
             sent_msg = await loop.run_in_executor(
                 None,
                 self.telegram_bot._send_message,
                 formatted,
-                None,
-                topic_id,
-                message.server_name
+                None,  # chat_id
+                topic_id,  # message_thread_id
+                message.server_name  # server_name for recovery
             )
             
             if sent_msg:
                 self.telegram_bot.message_mappings[str(message.timestamp)] = sent_msg.message_id
                 self.telegram_bot._save_data()
-                logger.success(f"✅ Successfully forwarded to Telegram topic {topic_id}")
+                
+                topic_info = f" to topic {topic_id}" if topic_id else " as regular message"
+                logger.success(f"✅ Successfully forwarded{topic_info}")
             else:
-                logger.error("Failed to send to Telegram")
+                logger.error("❌ Failed to send to Telegram")
             
         except Exception as e:
-            logger.error(f"Error forwarding to Telegram: {e}")
+            logger.error(f"❌ Error forwarding to Telegram: {e}")
     
     async def connect_websocket(self, ws_session):
         """Connect to Discord Gateway WebSocket"""

@@ -95,14 +95,59 @@ class DiscordTelegramParser:
         except:
             return False
     
+    def sync_servers(self):
+        """Sync Discord servers with Telegram topics - improved version"""
+        try:
+            # Get current Discord servers
+            current_servers = set(config.SERVER_CHANNEL_MAPPINGS.keys())
+            
+            # Get Telegram topics
+            telegram_topics = set(self.telegram_bot.server_topics.keys())
+            
+            logger.info(f"🔄 Syncing servers...")
+            logger.info(f"   Discord servers: {len(current_servers)}")
+            logger.info(f"   Telegram topics: {len(telegram_topics)}")
+            
+            # Clean up invalid topics first
+            cleaned_topics = self.telegram_bot.cleanup_invalid_topics()
+            if cleaned_topics > 0:
+                logger.info(f"   🧹 Cleaned {cleaned_topics} invalid topics")
+                telegram_topics = set(self.telegram_bot.server_topics.keys())  # Refresh after cleanup
+            
+            # Find new servers (don't create topics yet - wait for actual messages)
+            new_servers = current_servers - telegram_topics
+            if new_servers:
+                logger.info(f"   🆕 New servers found: {len(new_servers)}")
+                for server in new_servers:
+                    logger.info(f"      • {server} (topic will be created when needed)")
+            
+            # Find removed servers to delete topics
+            removed_servers = telegram_topics - current_servers
+            if removed_servers:
+                logger.info(f"   🗑️ Removing topics for deleted servers: {len(removed_servers)}")
+                for server in removed_servers:
+                    if server in self.telegram_bot.server_topics:
+                        old_topic_id = self.telegram_bot.server_topics[server]
+                        del self.telegram_bot.server_topics[server]
+                        logger.info(f"      • Removed {server} (topic {old_topic_id})")
+                
+                if removed_servers:
+                    self.telegram_bot._save_data()
+            
+            logger.success(f"✅ Server sync completed")
+            
+        except Exception as e:
+            error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
+            logger.error(f"❌ Error in server sync: {error_msg}")
+
     def initial_sync(self):
-        """Perform initial sync of recent messages with smart channel filtering"""
+        """Perform initial sync with improved topic management"""
         try:
             # Discover channels if not already configured
             if not config.SERVER_CHANNEL_MAPPINGS:
                 self.discover_channels()
             
-            # Sync servers between Discord and Telegram
+            # Sync servers between Discord and Telegram (cleanup invalid topics)
             self.sync_servers()
             
             # Get recent messages from HTTP-accessible channels only
@@ -120,9 +165,9 @@ class DiscordTelegramParser:
                 for channel_id, channel_name in channels.items():
                     safe_channel = self.safe_encode_string(channel_name)
                     
-                    # Быстрая проверка HTTP доступа
+                    # Quick HTTP access test
                     if self.test_channel_http_access(channel_id):
-                        # HTTP доступен - синхронизируем
+                        # HTTP accessible - sync
                         try:
                             recent_messages = self.discord_parser.parse_announcement_channel(
                                 channel_id, 
@@ -147,7 +192,7 @@ class DiscordTelegramParser:
                             logger.warning(f"❌ HTTP sync failed: {safe_server}#{safe_channel}: {safe_error}")
                             websocket_only_channels.append((safe_server, safe_channel))
                     else:
-                        # HTTP недоступен - оставляем для WebSocket
+                        # HTTP not accessible - leave for WebSocket
                         websocket_only_channels.append((safe_server, safe_channel))
                         logger.info(f"🔌 WebSocket only: {safe_server}#{safe_channel} - will monitor via WebSocket")
             
@@ -162,13 +207,29 @@ class DiscordTelegramParser:
                 for server, channel in websocket_only_channels:
                     logger.info(f"   • {server}#{channel}")
             
-            # Forward HTTP messages to Telegram in chronological order
+            # Group messages by server before sending to Telegram
             if messages:
                 messages.sort(key=lambda x: x.timestamp)
-                self.telegram_bot.send_messages(messages)
-                logger.success(f"✅ Initial HTTP sync completed: {len(messages)} messages")
+                
+                # Group by server to ensure proper topic management
+                server_messages = {}
+                for msg in messages:
+                    server = msg.server_name
+                    if server not in server_messages:
+                        server_messages[server] = []
+                    server_messages[server].append(msg)
+                
+                logger.info(f"📤 Sending messages for {len(server_messages)} servers with improved topic logic")
+                
+                # Send messages with proper topic management
+                for server, msgs in server_messages.items():
+                    logger.info(f"   📍 {server}: {len(msgs)} messages")
+                    # This will use the improved topic logic (one server = one topic)
+                    self.telegram_bot.send_messages(msgs)
+                
+                logger.success(f"✅ Initial HTTP sync completed: {len(messages)} messages sent")
             else:
-                logger.info("No HTTP messages found during initial sync")
+                logger.info("ℹ️ No HTTP messages found during initial sync")
             
             logger.success(f"🎉 Smart initial sync complete! WebSocket will handle real-time monitoring.")
             
@@ -180,7 +241,7 @@ class DiscordTelegramParser:
             logger.error(f"❌ Error in initial sync: {error_msg}")
     
     def fallback_polling_loop(self):
-        """Fallback polling loop for HTTP-accessible channels only"""
+        """Improved fallback polling with proper topic management"""
         while self.running:
             try:
                 time.sleep(300)  # Check every 5 minutes as fallback
@@ -190,7 +251,7 @@ class DiscordTelegramParser:
                 
                 logger.debug("🔄 Fallback polling check (HTTP channels only)...")
                 
-                messages = []
+                server_messages = {}  # Group by server
                 recent_threshold = datetime.now().timestamp() - 120  # 2 minutes ago
                 
                 for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
@@ -223,17 +284,26 @@ class DiscordTelegramParser:
                                 msg for msg in recent_messages
                                 if msg.timestamp.timestamp() > recent_threshold
                             ]
-                            messages.extend(new_messages)
+                            
+                            # Group by server
+                            if new_messages:
+                                if safe_server not in server_messages:
+                                    server_messages[safe_server] = []
+                                server_messages[safe_server].extend(new_messages)
                             
                         except Exception as e:
                             logger.debug(f"Fallback polling error for {safe_server}#{safe_channel}: {e}")
                             continue
                 
-                # Send any found messages
-                if messages:
-                    messages.sort(key=lambda x: x.timestamp)
-                    logger.info(f"🔄 Fallback polling found {len(messages)} new messages")
-                    self.telegram_bot.send_messages(messages)
+                # Send messages grouped by server (proper topic management)
+                if server_messages:
+                    total_messages = sum(len(msgs) for msgs in server_messages.values())
+                    logger.info(f"🔄 Fallback polling found {total_messages} new messages in {len(server_messages)} servers")
+                    
+                    for server, msgs in server_messages.items():
+                        msgs.sort(key=lambda x: x.timestamp)  # Chronological order
+                        logger.info(f"   📍 {server}: {len(msgs)} messages")
+                        self.telegram_bot.send_messages(msgs)  # Uses improved topic logic
                 
             except Exception as e:
                 error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
@@ -241,12 +311,12 @@ class DiscordTelegramParser:
                 time.sleep(60)
     
     def run(self):
-        """Run all components with WebSocket priority and smart initial sync"""
+        """Run all components with improved topic management"""
         self.running = True
         
         try:
-            # Perform smart initial sync (HTTP channels only)
-            logger.info("🚀 Starting smart initial sync...")
+            # Perform smart initial sync with improved topic logic
+            logger.info("🚀 Starting smart initial sync with improved topic management...")
             self.initial_sync()
             
             # Start Telegram bot in separate thread
@@ -255,7 +325,7 @@ class DiscordTelegramParser:
                 daemon=True
             )
             bot_thread.start()
-            logger.success("✅ Telegram bot started")
+            logger.success("✅ Telegram bot started with improved topic logic")
             
             # Start WebSocket service in separate thread
             websocket_thread = self.run_websocket_in_thread()
@@ -270,9 +340,14 @@ class DiscordTelegramParser:
             logger.success("✅ Fallback polling started (HTTP channels only)")
             
             # Keep main thread alive
-            logger.success("🎉 Discord Telegram Parser running with smart sync!")
-            logger.info("📊 HTTP channels: Initial sync + fallback polling")
-            logger.info("🔌 WebSocket channels: Real-time monitoring only")
+            logger.success("🎉 Discord Telegram Parser running with improved topic management!")
+            logger.info("📊 Features:")
+            logger.info("   ✅ One server = One topic (no duplicates)")
+            logger.info("   ✅ Thread-safe topic creation")
+            logger.info("   ✅ Auto-cleanup of invalid topics")
+            logger.info("   ✅ HTTP channels: Initial sync + fallback polling")
+            logger.info("   ✅ WebSocket channels: Real-time monitoring")
+            logger.info("   ✅ Messages grouped by server")
             logger.info("Press Ctrl+C to stop")
             
             while self.running:
@@ -290,29 +365,6 @@ class DiscordTelegramParser:
             error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
             logger.error(f"Error in main run loop: {error_msg}")
             self.running = False
-
-    def sync_servers(self):
-        """Sync Discord servers with Telegram topics"""
-        # Get current Discord servers
-        current_servers = set(config.SERVER_CHANNEL_MAPPINGS.keys())
-        
-        # Get Telegram topics
-        telegram_topics = set(self.telegram_bot.server_topics.keys())
-        
-        # Find new servers to add
-        new_servers = current_servers - telegram_topics
-        for server in new_servers:
-            # Create topic for new server
-            safe_server = self.safe_encode_string(server)
-            self.telegram_bot._create_or_get_topic(safe_server)
-        
-        # Find removed servers to delete
-        removed_servers = telegram_topics - current_servers
-        for server in removed_servers:
-            # Remove topic mapping
-            if server in self.telegram_bot.server_topics:
-                del self.telegram_bot.server_topics[server]
-                self.telegram_bot._save_data()
 
 def main():
     """Main entry point for the application"""
