@@ -86,8 +86,17 @@ class DiscordTelegramParser:
         except (UnicodeEncodeError, UnicodeDecodeError):
             return "[Encoding Error]"
     
+    def test_channel_http_access(self, channel_id):
+        """Quick test if channel is accessible via HTTP"""
+        try:
+            session = self.discord_parser.sessions[0]  # Use first session
+            r = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1')
+            return r.status_code == 200
+        except:
+            return False
+    
     def initial_sync(self):
-        """Perform initial sync of recent messages with better error handling"""
+        """Perform initial sync of recent messages with smart channel filtering"""
         try:
             # Discover channels if not already configured
             if not config.SERVER_CHANNEL_MAPPINGS:
@@ -96,57 +105,74 @@ class DiscordTelegramParser:
             # Sync servers between Discord and Telegram
             self.sync_servers()
             
-            # Get recent messages from all configured channels (one-time sync)
-            logger.info("Performing initial sync of recent messages...")
+            # Get recent messages from HTTP-accessible channels only
+            logger.info("🔍 Performing smart initial sync (HTTP-accessible channels only)...")
             messages = []
+            http_channels = []
+            websocket_only_channels = []
+            
             for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
-                # Skip empty channel mappings
                 if not channels:
                     continue
                 
-                # Safely encode server name
                 safe_server = self.safe_encode_string(server)
                     
                 for channel_id, channel_name in channels.items():
-                    try:
-                        # Safely encode channel name
-                        safe_channel = self.safe_encode_string(channel_name)
-                        
-                        # Get last 5 messages for initial sync
-                        recent_messages = self.discord_parser.parse_announcement_channel(
-                            channel_id, 
-                            safe_server,
-                            safe_channel,
-                            limit=5
-                        )
-                        
-                        # Clean message content for encoding issues
-                        for msg in recent_messages:
-                            msg.content = self.safe_encode_string(msg.content)
-                            msg.author = self.safe_encode_string(msg.author)
-                            msg.server_name = self.safe_encode_string(msg.server_name)
-                            msg.channel_name = self.safe_encode_string(msg.channel_name)
-                        
-                        messages.extend(recent_messages)
-                        logger.info(f"✅ Synced {len(recent_messages)} messages from {safe_server}#{safe_channel}")
-                        
-                    except Exception as channel_error:
-                        # Sanitize error message to handle encoding issues
-                        safe_error = str(channel_error).encode('utf-8', 'replace').decode('utf-8')
-                        logger.warning(f"❌ Error syncing {safe_server}#{safe_channel}: {safe_error}")
-                        continue
+                    safe_channel = self.safe_encode_string(channel_name)
+                    
+                    # Быстрая проверка HTTP доступа
+                    if self.test_channel_http_access(channel_id):
+                        # HTTP доступен - синхронизируем
+                        try:
+                            recent_messages = self.discord_parser.parse_announcement_channel(
+                                channel_id, 
+                                safe_server,
+                                safe_channel,
+                                limit=5
+                            )
+                            
+                            # Clean message content for encoding issues
+                            for msg in recent_messages:
+                                msg.content = self.safe_encode_string(msg.content)
+                                msg.author = self.safe_encode_string(msg.author)
+                                msg.server_name = self.safe_encode_string(msg.server_name)
+                                msg.channel_name = self.safe_encode_string(msg.channel_name)
+                            
+                            messages.extend(recent_messages)
+                            http_channels.append((safe_server, safe_channel))
+                            logger.info(f"✅ HTTP sync: {safe_server}#{safe_channel} - {len(recent_messages)} messages")
+                            
+                        except Exception as channel_error:
+                            safe_error = str(channel_error).encode('utf-8', 'replace').decode('utf-8')
+                            logger.warning(f"❌ HTTP sync failed: {safe_server}#{safe_channel}: {safe_error}")
+                            websocket_only_channels.append((safe_server, safe_channel))
+                    else:
+                        # HTTP недоступен - оставляем для WebSocket
+                        websocket_only_channels.append((safe_server, safe_channel))
+                        logger.info(f"🔌 WebSocket only: {safe_server}#{safe_channel} - will monitor via WebSocket")
             
-            # Forward messages to Telegram in chronological order
+            # Summary
+            logger.info(f"📊 Initial sync summary:")
+            logger.info(f"   ✅ HTTP synced: {len(http_channels)} channels")
+            logger.info(f"   🔌 WebSocket only: {len(websocket_only_channels)} channels")
+            logger.info(f"   📨 Total messages: {len(messages)}")
+            
+            if websocket_only_channels:
+                logger.info(f"🔌 These channels will be monitored via WebSocket only:")
+                for server, channel in websocket_only_channels:
+                    logger.info(f"   • {server}#{channel}")
+            
+            # Forward HTTP messages to Telegram in chronological order
             if messages:
-                # Sort by timestamp (oldest first)
                 messages.sort(key=lambda x: x.timestamp)
                 self.telegram_bot.send_messages(messages)
-                logger.success(f"✅ Initial sync completed: {len(messages)} messages")
+                logger.success(f"✅ Initial HTTP sync completed: {len(messages)} messages")
             else:
-                logger.info("No messages found during initial sync")
+                logger.info("No HTTP messages found during initial sync")
+            
+            logger.success(f"🎉 Smart initial sync complete! WebSocket will handle real-time monitoring.")
             
         except Exception as e:
-            # Handle any Unicode/encoding errors more robustly
             try:
                 error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
             except:
@@ -154,7 +180,7 @@ class DiscordTelegramParser:
             logger.error(f"❌ Error in initial sync: {error_msg}")
     
     def fallback_polling_loop(self):
-        """Fallback polling loop (runs alongside WebSocket for redundancy)"""
+        """Fallback polling loop for HTTP-accessible channels only"""
         while self.running:
             try:
                 time.sleep(300)  # Check every 5 minutes as fallback
@@ -162,9 +188,8 @@ class DiscordTelegramParser:
                 if not config.SERVER_CHANNEL_MAPPINGS:
                     continue
                 
-                logger.debug("🔄 Fallback polling check...")
+                logger.debug("🔄 Fallback polling check (HTTP channels only)...")
                 
-                # Quick check for very recent messages (last 2 minutes)
                 messages = []
                 recent_threshold = datetime.now().timestamp() - 120  # 2 minutes ago
                 
@@ -172,10 +197,13 @@ class DiscordTelegramParser:
                     safe_server = self.safe_encode_string(server)
                     
                     for channel_id, channel_name in channels.items():
+                        # Only poll HTTP-accessible channels
+                        if not self.test_channel_http_access(channel_id):
+                            continue  # Skip WebSocket-only channels
+                            
                         try:
                             safe_channel = self.safe_encode_string(channel_name)
                             
-                            # Get only very recent messages
                             recent_messages = self.discord_parser.parse_announcement_channel(
                                 channel_id, 
                                 safe_server,
@@ -190,7 +218,7 @@ class DiscordTelegramParser:
                                 msg.server_name = self.safe_encode_string(msg.server_name)
                                 msg.channel_name = self.safe_encode_string(msg.channel_name)
                             
-                            # Filter for messages from last 2 minutes
+                            # Filter for very recent messages
                             new_messages = [
                                 msg for msg in recent_messages
                                 if msg.timestamp.timestamp() > recent_threshold
@@ -213,12 +241,12 @@ class DiscordTelegramParser:
                 time.sleep(60)
     
     def run(self):
-        """Run all components with WebSocket priority and fallback polling"""
+        """Run all components with WebSocket priority and smart initial sync"""
         self.running = True
         
         try:
-            # Perform initial sync
-            logger.info("🚀 Starting initial sync...")
+            # Perform smart initial sync (HTTP channels only)
+            logger.info("🚀 Starting smart initial sync...")
             self.initial_sync()
             
             # Start Telegram bot in separate thread
@@ -233,16 +261,18 @@ class DiscordTelegramParser:
             websocket_thread = self.run_websocket_in_thread()
             logger.success("✅ WebSocket service started")
             
-            # Start fallback polling in separate thread
+            # Start fallback polling in separate thread (HTTP channels only)
             fallback_thread = threading.Thread(
                 target=self.fallback_polling_loop,
                 daemon=True
             )
             fallback_thread.start()
-            logger.success("✅ Fallback polling started")
+            logger.success("✅ Fallback polling started (HTTP channels only)")
             
             # Keep main thread alive
-            logger.success("🎉 Discord Telegram Parser is running with real-time WebSocket support!")
+            logger.success("🎉 Discord Telegram Parser running with smart sync!")
+            logger.info("📊 HTTP channels: Initial sync + fallback polling")
+            logger.info("🔌 WebSocket channels: Real-time monitoring only")
             logger.info("Press Ctrl+C to stop")
             
             while self.running:
