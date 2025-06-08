@@ -90,8 +90,11 @@ class DiscordWebSocketService:
                     ws_session['user_id'] = data['d']['user']['id']
                     logger.success(f"WebSocket ready for user: {data['d']['user']['username']}")
                     
-                    # Subscribe to announcement channels
-                    await self.subscribe_to_channels(ws_session)
+                    # Load existing channel subscriptions from config
+                    await self.load_channel_subscriptions()
+                    
+                    # Subscribe to channels via HTTP API (more reliable)
+                    await self.subscribe_to_configured_channels(ws_session)
                     
                 elif event_type == 'MESSAGE_CREATE':
                     await self.handle_new_message(data['d'])
@@ -102,6 +105,49 @@ class DiscordWebSocketService:
                     
         except Exception as e:
             logger.error(f"Error handling gateway message: {e}")
+    
+    async def load_channel_subscriptions(self):
+        """Load channel subscriptions from config"""
+        try:
+            for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
+                for channel_id in channels.keys():
+                    self.subscribed_channels.add(channel_id)
+                    logger.info(f"Loaded subscription for channel {channel_id} in {server}")
+            
+            logger.info(f"Loaded {len(self.subscribed_channels)} channel subscriptions from config")
+        except Exception as e:
+            logger.error(f"Error loading channel subscriptions: {e}")
+    
+    async def subscribe_to_configured_channels(self, ws_session):
+        """Subscribe to configured announcement channels using HTTP API"""
+        try:
+            logger.info("Subscribing to configured announcement channels...")
+            
+            # Use HTTP API to verify channel access
+            async with aiohttp.ClientSession() as session:
+                headers = {'Authorization': ws_session['token']}
+                
+                for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
+                    for channel_id, channel_name in channels.items():
+                        try:
+                            # Test channel access
+                            async with session.get(
+                                f'https://discord.com/api/v9/channels/{channel_id}',
+                                headers=headers
+                            ) as resp:
+                                if resp.status == 200:
+                                    self.subscribed_channels.add(channel_id)
+                                    logger.success(f"✅ Subscribed to {server}#{channel_name} ({channel_id})")
+                                else:
+                                    logger.warning(f"❌ Cannot access {server}#{channel_name} ({channel_id}) - Status: {resp.status}")
+                        except Exception as e:
+                            logger.warning(f"Error checking channel {channel_id}: {e}")
+                            continue
+                
+                logger.info(f"Active subscriptions: {len(self.subscribed_channels)} channels")
+                
+        except Exception as e:
+            logger.error(f"Error subscribing to channels: {e}")
     
     async def discover_guild_channels(self, guild_data, ws_session):
         """Discover announcement channels in a guild"""
@@ -128,36 +174,6 @@ class DiscordWebSocketService:
         except Exception as e:
             logger.error(f"Error discovering guild channels: {e}")
     
-    async def subscribe_to_channels(self, ws_session):
-        """Subscribe to announcement channels using lazy guilds"""
-        try:
-            # Get user's guilds via HTTP API first
-            async with aiohttp.ClientSession() as session:
-                headers = {'Authorization': ws_session['token']}
-                async with session.get('https://discord.com/api/v9/users/@me/guilds', headers=headers) as resp:
-                    if resp.status == 200:
-                        guilds = await resp.json()
-                        
-                        for guild in guilds:
-                            # Request guild channels
-                            async with session.get(f'https://discord.com/api/v9/guilds/{guild["id"]}/channels', headers=headers) as channel_resp:
-                                if channel_resp.status == 200:
-                                    channels = await channel_resp.json()
-                                    
-                                    for channel in channels:
-                                        if (channel['type'] == 0 and  # Text channel
-                                            'announcement' in channel['name'].lower()):
-                                            self.subscribed_channels.add(channel['id'])
-                                            
-                                            # Update config
-                                            guild_name = guild['name']
-                                            if guild_name not in config.SERVER_CHANNEL_MAPPINGS:
-                                                config.SERVER_CHANNEL_MAPPINGS[guild_name] = {}
-                                            config.SERVER_CHANNEL_MAPPINGS[guild_name][channel['id']] = channel['name']
-                
-        except Exception as e:
-            logger.error(f"Error subscribing to channels: {e}")
-    
     async def handle_new_message(self, message_data):
         """Process new message from WebSocket"""
         try:
@@ -165,6 +181,7 @@ class DiscordWebSocketService:
             
             # Only process messages from subscribed announcement channels
             if channel_id not in self.subscribed_channels:
+                logger.debug(f"Ignoring message from unsubscribed channel {channel_id}")
                 return
             
             # Find server and channel info
@@ -178,41 +195,53 @@ class DiscordWebSocketService:
                     break
             
             if not server_name:
+                logger.warning(f"Received message from subscribed channel {channel_id} but no server mapping found")
                 return
             
             # Safely extract message content with Unicode handling
             try:
-                content = message_data['content']
-                # Handle potential surrogate characters
+                content = message_data.get('content', '')
+                # Handle potential surrogate characters and encoding issues
                 if content:
+                    # Convert surrogates to replacement characters
                     content = content.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
+                    # Remove any remaining problematic characters
+                    content = ''.join(char for char in content if ord(char) < 0x110000)
             except (UnicodeEncodeError, UnicodeDecodeError):
-                content = message_data.get('content', '[Message content encoding error]')
+                content = '[Message content encoding error]'
                 logger.warning(f"Unicode encoding issue in message content from {server_name}")
             
             try:
                 author = message_data['author']['username']
                 author = author.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
+                author = ''.join(char for char in author if ord(char) < 0x110000)
             except (UnicodeEncodeError, UnicodeDecodeError, KeyError):
                 author = 'Unknown User'
                 logger.warning(f"Unicode encoding issue in author name from {server_name}")
             
+            # Skip empty messages
+            if not content.strip():
+                logger.debug(f"Skipping empty message from {server_name}#{channel_name}")
+                return
+            
             # Create Message object
             message = Message(
                 content=content,
-                timestamp=datetime.fromisoformat(message_data['timestamp']),
+                timestamp=datetime.fromisoformat(message_data['timestamp'].replace('Z', '+00:00')),
                 server_name=server_name,
                 channel_name=channel_name,
                 author=author
             )
             
-            logger.info(f"New message in {server_name}#{channel_name}: {author}")
+            logger.info(f"📨 New message in {server_name}#{channel_name}: {author} - {content[:50]}...")
             
             # Forward to Telegram if bot is available
             if self.telegram_bot:
                 await asyncio.create_task(
                     self.forward_to_telegram(message)
                 )
+            else:
+                logger.warning("Telegram bot not available for message forwarding")
                 
         except Exception as e:
             # Handle any Unicode errors in exception reporting
@@ -225,6 +254,8 @@ class DiscordWebSocketService:
     async def forward_to_telegram(self, message):
         """Forward message to Telegram bot asynchronously"""
         try:
+            logger.info(f"Forwarding message to Telegram: {message.server_name}#{message.channel_name}")
+            
             # Run Telegram bot methods in executor since they're synchronous
             loop = asyncio.get_event_loop()
             
@@ -234,6 +265,10 @@ class DiscordWebSocketService:
                 self.telegram_bot._create_or_get_topic,
                 message.server_name
             )
+            
+            if not topic_id:
+                logger.error(f"Failed to get/create topic for server {message.server_name}")
+                return
             
             # Format and send message
             formatted = self.telegram_bot.format_message(message)
@@ -250,7 +285,9 @@ class DiscordWebSocketService:
                 # Store mapping
                 self.telegram_bot.message_mappings[str(message.timestamp)] = sent_msg.message_id
                 self.telegram_bot._save_data()
-                logger.success(f"Forwarded message to Telegram topic {topic_id}")
+                logger.success(f"✅ Forwarded message to Telegram topic {topic_id}")
+            else:
+                logger.error(f"Failed to send message to Telegram")
             
         except Exception as e:
             logger.error(f"Error forwarding to Telegram: {e}")
